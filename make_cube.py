@@ -24,7 +24,7 @@ BEVEL = 0.025        # rounded edge width in metres
 TEX = 64             # texture resolution (tiny on purpose)
 BOTTOM = (0.36, 0.25, 0.85)   # violet (sRGB 0..1)
 TOP = (0.25, 0.88, 0.82)      # mint cyan
-GLOW = 0.65          # how far the edge colour is pushed toward white
+GLOW = 0.45          # how far the edge colour is pushed toward white
 EMISSION = 0.45      # emission strength (0 = no glow)
 OUT = Path(__file__).resolve().parent / "cube.glb"
 
