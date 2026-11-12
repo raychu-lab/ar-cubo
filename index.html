@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>AR Cubo</title>
+  <style>
+    :root { --bg: #14121f; --fg: #f3f1ff; --accent: #40e0d0; --accent2: #5b3fd9; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    body { display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center; padding: 16px; }
+    h1 { font-size: 1.6rem; margin: 0 0 .4rem; }
+    p { margin: .3rem 0; opacity: .8; max-width: 32rem; line-height: 1.4; }
+    #start { margin-top: 1.5rem; font-size: 1.4rem; font-weight: 700; padding: 1.1rem 2.6rem;
+      border: 0; border-radius: 999px; color: #fff; cursor: pointer;
+      background: linear-gradient(135deg, var(--accent2), var(--accent));
+      box-shadow: 0 8px 30px rgba(64, 224, 208, .35); }
+    #start[hidden], #fallback[hidden], #status:empty { display: none; }
+    #status { margin-top: 1rem; font-size: .9rem; }
+    /* Fallback viewer (iPhone / desktop) */
+    #fallback { width: 100%; max-width: 32rem; }
+    model-viewer { width: 100%; height: 60vh; background: radial-gradient(#2a2640, var(--bg)); border-radius: 16px; }
+    #ar-button { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+      font-size: 1.1rem; font-weight: 700; padding: .8rem 1.8rem; border: 0; border-radius: 999px;
+      color: #fff; background: linear-gradient(135deg, var(--accent2), var(--accent)); }
+    /* Text shown on top of the camera while in AR (WebXR DOM overlay) */
+    #overlay { position: fixed; inset: 0; pointer-events: none; display: none; }
+    #hint { position: absolute; left: 50%; bottom: 40px; transform: translateX(-50%);
+      background: rgba(0,0,0,.55); color: #fff; padding: .6rem 1.1rem; border-radius: 999px;
+      font-size: 1rem; white-space: nowrap; }
+  </style>
+
+  <!-- three.js from a CDN through an import map: no build step needed. -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <h1>AR Cubo</h1>
+  <p id="intro">Un cubo flotando en tu habitación, visto a través de la cámara.</p>
+
+  <!-- Android (Chrome): real WebXR AR -->
+  <button id="start" hidden>Start AR</button>
+
+  <!-- iPhone (Safari) and desktop: model-viewer, AR through Quick Look / Scene Viewer -->
+  <div id="fallback" hidden>
+    <p>Tu navegador no tiene WebXR AR. Pulsa «Ver en AR» para abrirlo con la cámara.</p>
+    <model-viewer id="viewer" src="cube.glb" alt="Cubo flotante"
+      ar ar-modes="webxr scene-viewer quick-look" ar-placement="floor" ar-scale="fixed"
+      camera-controls auto-rotate shadow-intensity="1" exposure="1.1">
+      <button slot="ar-button" id="ar-button">Ver en AR</button>
+    </model-viewer>
+  </div>
+
+  <p id="status"></p>
+  <div id="overlay"><div id="hint">Mueve el móvil despacio para detectar el suelo</div></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+    // ---------------------------------------------------------------------
+    // Settings: change these to use your own Blender model.
+    // ---------------------------------------------------------------------
+    const MODEL_URL = "cube.glb";  // any GLB in metres, origin at its centre
+    const HOVER = 0.30;            // gap between the surface and the model's bottom (m)
+    const BOB = 0.03;              // up/down float amplitude (m)
+    const BOB_SPEED = 1.2;         // float cycles per ~5 s
+    const SPIN_SPEED = 0.4;        // rotation, radians per second
+
+    const startButton = document.getElementById("start");
+    const statusText = document.getElementById("status");
+    const overlay = document.getElementById("overlay");
+    const hint = document.getElementById("hint");
+
+    // ---------------------------------------------------------------------
+    // 1. Decide which path to use: WebXR AR (Android) or model-viewer (iPhone/desktop)
+    // ---------------------------------------------------------------------
+    const arSupported = navigator.xr ? await navigator.xr.isSessionSupported("immersive-ar").catch(() => false) : false;
+    if (arSupported) {
+      startButton.hidden = false;
+      startButton.addEventListener("click", startAR);
+    } else {
+      // model-viewer is only loaded when needed. On iPhone it converts the GLB to USDZ
+      // on the fly and opens Apple's Quick Look AR.
+      await import("https://cdn.jsdelivr.net/npm/@google/model-viewer@3.5.0/dist/model-viewer.min.js");
+      document.getElementById("fallback").hidden = false;
+    }
+
+    // ---------------------------------------------------------------------
+    // 2. three.js scene (only used in WebXR mode)
+    // ---------------------------------------------------------------------
+    let renderer, scene, camera, reticle, holder, model, shadow;
+    let hitTestSource = null;
+    let placed = false;
+    const clock = new THREE.Clock();
+
+    function buildScene() {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });  // alpha: camera shows through
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      // Soft light from above plus a key light, so the model has shape on any background.
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x8877aa, 2.0));
+      const key = new THREE.DirectionalLight(0xffffff, 1.5);
+      key.position.set(0.5, 1, 0.3);
+      scene.add(key);
+
+      // Reticle: a ring that sits on detected surfaces.
+      reticle = new THREE.Mesh(
+        new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2),
+        new THREE.MeshBasicMaterial({ color: 0x40e0d0 })
+      );
+      reticle.matrixAutoUpdate = false;  // its matrix comes straight from the hit test
+      reticle.visible = false;
+      scene.add(reticle);
+
+      // holder = the spot on the surface. It carries the fake shadow and the floating model.
+      holder = new THREE.Group();
+      holder.visible = false;
+      scene.add(holder);
+
+      shadow = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.4, 0.4).rotateX(-Math.PI / 2),
+        new THREE.MeshBasicMaterial({ map: shadowTexture(), transparent: true, depthWrite: false })
+      );
+      holder.add(shadow);
+
+      loadModel();
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    }
+
+    // Fake shadow: a blurred dark disc painted on a canvas.
+    function shadowTexture() {
+      const size = 128, canvas = document.createElement("canvas");
+      canvas.width = canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+      g.addColorStop(0, "rgba(0,0,0,0.55)");
+      g.addColorStop(0.5, "rgba(0,0,0,0.25)");
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, size, size);
+      return new THREE.CanvasTexture(canvas);
+    }
+
+    // Load the GLB. Its lowest point is lifted to HOVER above the surface.
+    function loadModel() {
+      new GLTFLoader().load(MODEL_URL, (gltf) => {
+        model = new THREE.Group();          // spins around its own centre
+        const box = new THREE.Box3().setFromObject(gltf.scene);
+        const centre = box.getCenter(new THREE.Vector3());
+        gltf.scene.position.sub(centre);    // centre the mesh on the pivot
+        model.add(gltf.scene);
+        model.userData.baseY = HOVER + (box.max.y - box.min.y) / 2;
+        holder.add(model);
+      }, undefined, (err) => { statusText.textContent = "No se pudo cargar " + MODEL_URL; console.error(err); });
+    }
+
+    // ---------------------------------------------------------------------
+    // 3. Start the AR session
+    // ---------------------------------------------------------------------
+    async function startAR() {
+      if (!renderer) buildScene();
+      try {
+        const session = await navigator.xr.requestSession("immersive-ar", {
+          requiredFeatures: ["hit-test"],
+          optionalFeatures: ["dom-overlay"],
+          domOverlay: { root: overlay },
+        });
+        renderer.xr.setReferenceSpaceType("local");
+        await renderer.xr.setSession(session);
+        overlay.style.display = "block";
+
+        // Hit test from the centre of the screen ("viewer" space) every frame.
+        const viewerSpace = await session.requestReferenceSpace("viewer");
+        hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+
+        // A tap on the screen arrives as a "select" event.
+        session.addEventListener("select", placeModel);
+        session.addEventListener("end", () => {
+          hitTestSource = null;
+          overlay.style.display = "none";
+          renderer.setAnimationLoop(null);
+        });
+        renderer.setAnimationLoop(render);
+      } catch (err) {
+        statusText.textContent = "No se pudo iniciar AR: " + err.message;
+        console.error(err);
+      }
+    }
+
+    // Put the holder where the reticle is. Tapping again moves it.
+    function placeModel() {
+      if (!reticle.visible) return;
+      const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+      holder.position.copy(pos);   // position only: the model always floats straight up
+      holder.visible = true;
+      placed = true;
+      hint.textContent = "Toca otra vez para moverlo";
+    }
+
+    // ---------------------------------------------------------------------
+    // 4. Every frame: update the reticle and animate the floating model
+    // ---------------------------------------------------------------------
+    function render(time, frame) {
+      if (frame && hitTestSource) {
+        const refSpace = renderer.xr.getReferenceSpace();
+        const hits = frame.getHitTestResults(hitTestSource);
+        if (hits.length) {
+          reticle.visible = true;
+          reticle.matrix.fromArray(hits[0].getPose(refSpace).transform.matrix);
+          if (!placed) hint.textContent = "Toca la pantalla para colocar el cubo";
+        } else {
+          reticle.visible = false;
+        }
+      }
+
+      if (model) {
+        const t = clock.getElapsedTime();
+        const bob = Math.sin(t * BOB_SPEED) * BOB;          // -BOB .. +BOB
+        model.position.y = model.userData.baseY + bob;
+        model.rotation.y = t * SPIN_SPEED;
+        model.rotation.x = Math.sin(t * 0.5) * 0.15;        // slight tilt, feels weightless
+        // Shadow grows softer and lighter as the model rises.
+        const k = 1 + bob / BOB * 0.15;
+        shadow.scale.setScalar(k);
+        shadow.material.opacity = 1.15 - k * 0.5;
+      }
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>
